@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/gorilla/websocket"
@@ -107,7 +108,7 @@ func (cli *client) write() {
 	}
 }
 
-func wsPage(res http.ResponseWriter, req *http.Request) {
+func serveConn(res http.ResponseWriter, req *http.Request) {
 	upgrader := &websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -133,9 +134,23 @@ func wsPage(res http.ResponseWriter, req *http.Request) {
 	go cli.write()
 }
 
+func serveSite(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.URL)
+	if r.URL.Path != "/" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	http.ServeFile(w, r, "index.html")
+}
+
 func main() {
 	fmt.Println("Starting application...")
 	go room.run()
-	http.HandleFunc("/ws", wsPage)
+	http.HandleFunc("/", serveSite)
+	http.HandleFunc("/ws", serveConn)
 	http.ListenAndServe(":8765", nil)
 }
