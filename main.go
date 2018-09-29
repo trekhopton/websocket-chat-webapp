@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,8 @@ var room = chatRoom{
 	leaving:     make(chan *client),
 }
 
+var addr = flag.String("addr", ":8080", "http service address")
+
 type chatRoom struct {
 	clients     map[*client]bool
 	toBroadcast chan []byte
@@ -25,21 +28,29 @@ type chatRoom struct {
 }
 
 type client struct {
-	id        string
+	username  string
+	userID    string
 	socket    *websocket.Conn
 	forClient chan []byte
 }
 
 type message struct {
-	Sender    string `json:"sender,omitempty"`
-	Recipient string `json:"recipient,omitempty"`
-	Text      string `json:"content,omitempty"`
+	Username string `json:"username,omitempty"`
+	UserID   string `json:"userID,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Type     string `json:"type,omitempty"`
 }
 
 func (cr *chatRoom) broadcast(jmsg []byte, ignore *client) {
 	for cli := range cr.clients {
 		if cli != ignore {
-			cli.forClient <- jmsg
+			select {
+			case cli.forClient <- jmsg:
+			default:
+				go func() {
+					cr.leaving <- cli
+				}()
+			}
 		}
 	}
 }
@@ -50,24 +61,17 @@ func (cr *chatRoom) run() {
 		// joining clients are added to map of clients
 		case cli := <-cr.joining:
 			cr.clients[cli] = true
-			jsonMsg, _ := json.Marshal(&message{Text: "/A user has connected."})
-			cr.broadcast(jsonMsg, cli)
+			jsonMsg, _ := json.Marshal(&message{Username: "SYSTEM", Text: cli.username + " has connected."})
+			cr.broadcast(jsonMsg, nil)
 		case cli := <-cr.leaving:
 			if _, ok := cr.clients[cli]; ok {
 				close(cli.forClient)
 				delete(cr.clients, cli)
-				jsonMsg, _ := json.Marshal(&message{Text: "/A user has disconnected."})
-				cr.broadcast(jsonMsg, cli)
+				jsonMsg, _ := json.Marshal(&message{Username: "SYSTEM", Text: cli.username + " has disconnected."})
+				cr.broadcast(jsonMsg, nil)
 			}
 		case msg := <-cr.toBroadcast:
-			for cli := range cr.clients {
-				select {
-				case cli.forClient <- msg:
-				default: // go routine, cli should be put into leaving?
-					close(cli.forClient)
-					delete(cr.clients, cli)
-				}
-			}
+			cr.broadcast(msg, nil)
 		}
 	}
 }
@@ -79,14 +83,22 @@ func (cli *client) read() {
 	}()
 
 	for {
-		_, msgTxt, err := cli.socket.ReadMessage()
+		_, msgIn, err := cli.socket.ReadMessage()
 		if err != nil {
 			room.leaving <- cli
 			cli.socket.Close()
 			break
 		}
-		jmsg, _ := json.Marshal(&message{Sender: cli.id, Text: string(msgTxt)})
-		room.toBroadcast <- jmsg
+		msg := message{UserID: cli.userID}
+		json.Unmarshal(msgIn, &msg)
+
+		if msg.Type == "join" {
+			cli.username = msg.Username
+			room.joining <- cli
+		} else {
+			jmsg, _ := json.Marshal(&msg)
+			room.toBroadcast <- jmsg
+		}
 	}
 }
 
@@ -123,34 +135,27 @@ func serveConn(res http.ResponseWriter, req *http.Request) {
 
 	id, _ := uuid.NewV4()
 	cli := &client{
-		id:        id.String(),
+		userID:    id.String(),
 		socket:    conn,
 		forClient: make(chan []byte),
 	}
-
-	room.joining <- cli
 
 	go cli.read()
 	go cli.write()
 }
 
-func serveSite(w http.ResponseWriter, r *http.Request) {
-	log.Println(r.URL)
-	if r.URL.Path != "/" {
-		http.Error(w, "Not found", http.StatusNotFound)
-		return
-	}
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	http.ServeFile(w, r, "index.html")
+func logMux(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		log.Println(req.RemoteAddr, req.Method, req.URL)
+		handler.ServeHTTP(res, req)
+	})
 }
 
 func main() {
-	fmt.Println("Starting application...")
+	flag.Parse()
+	fmt.Println("Starting server...")
 	go room.run()
-	http.HandleFunc("/", serveSite)
+	http.Handle("/", http.FileServer(http.Dir("./")))
 	http.HandleFunc("/ws", serveConn)
-	http.ListenAndServe(":8765", nil)
+	http.ListenAndServe(*addr, logMux(http.DefaultServeMux))
 }
